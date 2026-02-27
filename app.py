@@ -1,10 +1,3 @@
-# app.py
-# Optimisation tournées multi-techniciens (OSM/OSRM) — Skills via menus déroulants (référentiel)
-# + IDs stables (Tech_ID / Job_ID) pour générer les menus même quand on ajoute des lignes
-# + Validation d’adresses explicite
-# + HO/HNO (horaires ouvrés) pris en compte selon heure de départ
-# + Carte Folium (optionnelle si libs absentes)
-
 import time
 import math
 import requests
@@ -17,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# ---- Carte (optionnelle) : ne crash jamais si folium non installé
+# ---- Carte optionnelle
 MAP_ENABLED = True
 try:
     import folium
@@ -32,10 +25,9 @@ except Exception:
 st.set_page_config(page_title="Optimisation tournées multi-tech (OSM/OSRM)", layout="wide")
 st.title("Optimisation tournées multi-techniciens (OSM/OSRM)")
 st.caption(
-    "Affectation + ordre. Contraintes: heures max/tech, skills (menus), SLA, HO/HNO, validation adresses, carte. "
-    "Sans Google: OSM (Nominatim) + OSRM."
+    "Affectation + ordre. Contraintes: heures max/tech, skills (menus), SLA, HO/HNO, validation adresses. "
+    "Options par technicien: enchaîner ou retour agence entre jobs, et retour agence en fin."
 )
-
 
 # =========================================================
 # Models
@@ -49,6 +41,8 @@ class Tech:
     lat: float
     lon: float
     max_minutes: int
+    chain_jobs: bool          # True: job->job autorisé / False: retour agence entre chaque job
+    return_end: bool          # True: fin à l'agence / False: fin libre
     skills: Set[str]
 
 @dataclass
@@ -61,9 +55,9 @@ class Job:
     lon: float
     service_min: int
     required_skills: Set[str]
-    deadline_min: Optional[int]   # None = pas de SLA
-    priority: int                # 1..5
-    ho_mode: str                 # "HO", "HNO", "INDIFF"
+    deadline_min: Optional[int]
+    priority: int
+    ho_mode: str
 
 
 # =========================================================
@@ -108,7 +102,7 @@ def minutes_since_day_start(dt: datetime) -> int:
 
 
 # =========================================================
-# Geocoding OSM (Nominatim)
+# Geocoding OSM
 # =========================================================
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
@@ -131,7 +125,7 @@ def geocode_osm(address: str) -> Optional[Tuple[float, float, str]]:
 
 
 # =========================================================
-# OSRM Matrix
+# OSRM matrix
 # =========================================================
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
 
@@ -143,12 +137,12 @@ def osrm_table_minutes(coords: List[Tuple[float, float]]) -> List[List[int]]:
     url = OSRM_TABLE_URL + coord_str
     r = requests.get(url, params={"annotations": "duration"}, timeout=30)
     r.raise_for_status()
-    durations = r.json()["durations"]  # seconds
+    durations = r.json()["durations"]
     return [[int(round((d or 0) / 60.0)) for d in row] for row in durations]
 
 
 # =========================================================
-# HO/HNO -> Time windows (une fenêtre par job)
+# HO/HNO -> one time window
 # =========================================================
 def compute_job_time_window(
     ho_mode: str,
@@ -181,7 +175,7 @@ def compute_job_time_window(
 
 
 # =========================================================
-# OR-Tools Solver
+# Solver
 # =========================================================
 def solve_vrp_multi_tech(
     tm_min: List[List[int]],
@@ -190,29 +184,48 @@ def solve_vrp_multi_tech(
     starts: List[int],
     ends: List[int],
     job_nodes: List[int],
-    job_time_windows: Dict[int, Tuple[int, int]],     # node -> (a,b)
-    job_deadlines: Dict[int, int],                    # node -> deadline (minutes)
-    allowed_vehicles: Dict[int, List[int]],           # node -> list vehicles
+    job_time_windows: Dict[int, Tuple[int, int]],
+    job_deadlines: Dict[int, int],
+    allowed_vehicles: Dict[int, List[int]],
     priority_by_node: Dict[int, int],
     allow_drop: bool,
     time_limit_s: int,
+    # needed for "enchaîner" rule:
+    is_depot_node: List[bool],
+    is_job_node: List[bool],
 ):
     n = len(tm_min)
     m = len(techs)
-
     manager = pywrapcp.RoutingIndexManager(n, m, starts, ends)
     routing = pywrapcp.RoutingModel(manager)
 
-    # Objective: travel time only
-    def travel_cb(from_i, to_i):
-        f = manager.IndexToNode(from_i)
-        t = manager.IndexToNode(to_i)
-        return int(tm_min[f][t])
+    BIGM = 10**7  # cost to forbid transitions
 
-    travel_idx = routing.RegisterTransitCallback(travel_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(travel_idx)
+    # ---- cost callback PER VEHICLE to enforce "return between jobs"
+    def make_vehicle_cost_cb(v: int):
+        chain_ok = techs[v].chain_jobs
 
-    # Time dimension: travel + service at FROM
+        def cb(from_i, to_i):
+            f = manager.IndexToNode(from_i)
+            t = manager.IndexToNode(to_i)
+
+            base = int(tm_min[f][t])
+
+            if not chain_ok:
+                # forbid job->job for this vehicle
+                if is_job_node[f] and is_job_node[t]:
+                    return BIGM
+            return base
+
+        return cb
+
+    cost_cbs = []
+    for v in range(m):
+        idx = routing.RegisterTransitCallback(make_vehicle_cost_cb(v))
+        routing.SetArcCostEvaluatorOfVehicle(idx, v)
+        cost_cbs.append(idx)
+
+    # ---- time dimension (travel + service)
     def time_cb(from_i, to_i):
         f = manager.IndexToNode(from_i)
         t = manager.IndexToNode(to_i)
@@ -222,21 +235,21 @@ def solve_vrp_multi_tech(
     routing.AddDimension(time_idx, 0, 10**9, True, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
 
-    # Max work time per tech
+    # max time per tech
     for v, tech in enumerate(techs):
         time_dim.CumulVar(routing.End(v)).SetMax(int(tech.max_minutes))
 
-    # HO/HNO time windows
+    # HO/HNO windows
     for node, (a, b) in job_time_windows.items():
         idx = manager.NodeToIndex(int(node))
         time_dim.CumulVar(idx).SetRange(int(a), int(b))
 
-    # SLA deadlines -> enforce [0..deadline]
+    # SLA deadlines
     for node, dl in job_deadlines.items():
         idx = manager.NodeToIndex(int(node))
         time_dim.CumulVar(idx).SetRange(0, int(dl))
 
-    # Skills eligibility — robust method
+    # skills eligibility (robust)
     for node, vehs in allowed_vehicles.items():
         idx = int(manager.NodeToIndex(int(node)))
         if routing.IsStart(idx) or routing.IsEnd(idx):
@@ -244,7 +257,7 @@ def solve_vrp_multi_tech(
         vehs_clean = sorted({int(v) for v in vehs})
         routing.VehicleVar(idx).SetValues(vehs_clean)
 
-    # Optional drop (report) with penalty based on priority
+    # drop (optional)
     if allow_drop:
         for node in job_nodes:
             idx = manager.NodeToIndex(int(node))
@@ -276,17 +289,14 @@ def solve_vrp_multi_tech(
             nodes.append(manager.IndexToNode(idx))
             idx = sol.Value(routing.NextVar(idx))
         nodes.append(manager.IndexToNode(idx))
-
         end_time = sol.Value(time_dim.CumulVar(routing.End(v)))
-        routes.append(
-            {"vehicle": v, "tech": tech.name, "tech_id": tech.tech_id, "nodes": nodes, "end_time_min": int(end_time), "max_min": int(tech.max_minutes)}
-        )
+        routes.append({"vehicle": v, "tech": tech.name, "tech_id": tech.tech_id, "nodes": nodes, "end_time_min": int(end_time), "max_min": int(tech.max_minutes)})
 
     return {"routes": routes, "dropped": dropped}
 
 
 # =========================================================
-# Session state init (avec IDs)
+# Session state init (IDs + options)
 # =========================================================
 if "skills_df" not in st.session_state:
     st.session_state.skills_df = pd.DataFrame([{"Skill": "elec_b1v"}, {"Skill": "travail_en_hauteur"}])
@@ -294,8 +304,8 @@ if "skills_df" not in st.session_state:
 if "techs_df" not in st.session_state:
     st.session_state.techs_df = pd.DataFrame(
         [
-            {"ID": "T1", "Tech": "Tech A", "Adresse départ": "", "Heures max": 7.5},
-            {"ID": "T2", "Tech": "Tech B", "Adresse départ": "", "Heures max": 8.0},
+            {"ID": "T1", "Tech": "Tech A", "Adresse agence": "", "Heures max": 7.5, "Enchaîner ?": "OUI", "Retour fin ?": "OUI"},
+            {"ID": "T2", "Tech": "Tech B", "Adresse agence": "", "Heures max": 8.0, "Enchaîner ?": "OUI", "Retour fin ?": "OUI"},
         ]
     )
 
@@ -307,7 +317,6 @@ if "jobs_df" not in st.session_state:
         ]
     )
 
-# stock skills par ID (stable)
 if "tech_skills" not in st.session_state:
     st.session_state.tech_skills = {}  # tech_id -> list[str]
 if "job_skills" not in st.session_state:
@@ -332,8 +341,6 @@ with st.sidebar:
     allow_drop = st.checkbox("Autoriser le report (drop) si impossible", value=False)
     time_limit = st.slider("Temps de calcul max (s)", 5, 60, 15)
 
-    st.caption("HO/HNO est calculé depuis l’heure de départ.")
-
 
 # =========================================================
 # Layout
@@ -341,8 +348,7 @@ with st.sidebar:
 left, right = st.columns([1.25, 1.75])
 
 with left:
-    st.subheader("0) Référentiel skills (menus)")
-    st.write("Ajoute des skills ici. Ensuite tu les sélectionnes via menus (pas de champ libre).")
+    st.subheader("0) Référentiel skills")
     skills_df = st.data_editor(
         st.session_state.skills_df,
         num_rows="dynamic",
@@ -354,18 +360,19 @@ with left:
     st.session_state.skills_df = pd.DataFrame([{"Skill": s} for s in skills_list]) if skills_list else pd.DataFrame([{"Skill": ""}])
 
     st.divider()
-    st.subheader("1) Techniciens")
-    st.write("Ajoute/supprime des lignes. Le menu skills apparaît pour chaque ligne grâce à l’ID.")
+    st.subheader("1) Techniciens (agence + règles)")
     techs_df = st.data_editor(
         st.session_state.techs_df,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "ID": st.column_config.TextColumn(required=True, help="ID stable ex: T1, T2, T3..."),
+            "ID": st.column_config.TextColumn(required=True),
             "Tech": st.column_config.TextColumn(required=True),
-            "Adresse départ": st.column_config.TextColumn(required=True),
+            "Adresse agence": st.column_config.TextColumn(required=True),
             "Heures max": st.column_config.NumberColumn(min_value=0.0, step=0.5, required=True),
+            "Enchaîner ?": st.column_config.SelectboxColumn(options=["OUI", "NON"], required=True),
+            "Retour fin ?": st.column_config.SelectboxColumn(options=["OUI", "NON"], required=True),
         },
     )
     st.session_state.techs_df = techs_df
@@ -385,19 +392,16 @@ with left:
                 key=f"tech_skills__{tech_id}",
             )
             st.session_state.tech_skills[tech_id] = chosen
-    else:
-        st.warning("Ajoute au moins 1 skill dans le référentiel pour activer les menus.")
 
     st.divider()
     st.subheader("2) Interventions")
-    st.write("Même logique : menus skills par ligne grâce à l’ID.")
     jobs_df = st.data_editor(
         st.session_state.jobs_df,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "ID": st.column_config.TextColumn(required=True, help="ID stable ex: J1, J2, J3..."),
+            "ID": st.column_config.TextColumn(required=True),
             "Intervention": st.column_config.TextColumn(required=True),
             "Adresse": st.column_config.TextColumn(required=True),
             "Durée (min)": st.column_config.NumberColumn(min_value=0, step=5, required=True),
@@ -447,8 +451,8 @@ with right:
         st.info("Renseigne les tableaux, puis clique sur **Optimiser**.")
         st.stop()
 
-    # Prepare dataframes
-    techs_df = st.session_state.techs_df.copy().dropna(subset=["ID", "Tech", "Adresse départ", "Heures max"])
+    # Dataframes & checks
+    techs_df = st.session_state.techs_df.copy().dropna(subset=["ID", "Tech", "Adresse agence", "Heures max", "Enchaîner ?", "Retour fin ?"])
     jobs_df = st.session_state.jobs_df.copy().dropna(subset=["ID", "Intervention", "Adresse", "Durée (min)", "HO/HNO", "Priorité (1-5)"])
 
     if len(techs_df) == 0:
@@ -458,16 +462,15 @@ with right:
         st.error("Ajoute au moins 1 intervention.")
         st.stop()
 
-    # Check duplicate IDs (important)
     if techs_df["ID"].astype(str).duplicated().any():
-        st.error("IDs techniciens dupliqués. Chaque tech doit avoir un ID unique (T1, T2, T3...).")
+        st.error("IDs techniciens dupliqués (T1, T2, ...).")
         st.stop()
     if jobs_df["ID"].astype(str).duplicated().any():
-        st.error("IDs interventions dupliqués. Chaque job doit avoir un ID unique (J1, J2, J3...).")
+        st.error("IDs jobs dupliqués (J1, J2, ...).")
         st.stop()
 
     # -----------------------------------------------------
-    # Validation / Geocoding with clear messages
+    # Geocoding + validation
     # -----------------------------------------------------
     tech_rows = []
     bad_tech = []
@@ -475,8 +478,10 @@ with right:
         for _, row in techs_df.iterrows():
             tech_id = safe_str(row["ID"]).strip()
             name = safe_str(row["Tech"]).strip()
-            addr = safe_str(row["Adresse départ"]).strip()
+            addr = safe_str(row["Adresse agence"]).strip()
             max_h = float(row["Heures max"])
+            chain_jobs = safe_str(row["Enchaîner ?"]).strip().upper() == "OUI"
+            return_end = safe_str(row["Retour fin ?"]).strip().upper() == "OUI"
             skills = set(st.session_state.tech_skills.get(tech_id, []))
 
             g = None
@@ -486,21 +491,19 @@ with right:
                 g = None
 
             if g is None:
-                bad_tech.append({
-                    "Type": "Technicien",
-                    "ID": tech_id,
-                    "Nom": name,
-                    "Adresse": addr,
-                    "Erreur": "Adresse non reconnue. Ajoute: n°, rue, CP, ville, France."
-                })
-                tech_rows.append({"ID": tech_id, "Tech": name, "Adresse saisie": addr, "Statut": "❌ invalide", "Conseil": "Ajoute CP + ville + France"})
+                bad_tech.append({"Type": "Technicien", "ID": tech_id, "Nom": name, "Adresse": addr,
+                                "Erreur": "Adresse non reconnue. Ajoute: n°, rue, CP, ville, France."})
+                tech_rows.append({"ID": tech_id, "Tech": name, "Adresse saisie": addr, "Statut": "❌ invalide"})
                 continue
 
             lat, lon, disp = g
-            tech_rows.append({"ID": tech_id, "Tech": name, "Adresse saisie": addr, "Statut": "✅ OK", "Adresse résolue": disp})
+            tech_rows.append({"ID": tech_id, "Tech": name, "Statut": "✅ OK", "Adresse résolue": disp,
+                              "Enchaîner": "OUI" if chain_jobs else "NON", "Retour fin": "OUI" if return_end else "NON"})
             tech_rows[-1]["_lat"] = lat
             tech_rows[-1]["_lon"] = lon
             tech_rows[-1]["_max_min"] = hours_to_minutes(max_h)
+            tech_rows[-1]["_chain"] = chain_jobs
+            tech_rows[-1]["_return_end"] = return_end
             tech_rows[-1]["_skills"] = skills
             time.sleep(0.08)
 
@@ -525,18 +528,14 @@ with right:
                 g = None
 
             if g is None:
-                bad_jobs.append({
-                    "Type": "Intervention",
-                    "ID": job_id,
-                    "Nom": name,
-                    "Adresse": addr,
-                    "Erreur": "Adresse non reconnue. Ajoute: n°, rue, CP, ville, France."
-                })
-                job_rows.append({"ID": job_id, "Intervention": name, "Adresse saisie": addr, "Statut": "❌ invalide", "Conseil": "Ajoute CP + ville + France"})
+                bad_jobs.append({"Type": "Intervention", "ID": job_id, "Nom": name, "Adresse": addr,
+                                 "Erreur": "Adresse non reconnue. Ajoute: n°, rue, CP, ville, France."})
+                job_rows.append({"ID": job_id, "Intervention": name, "Adresse saisie": addr, "Statut": "❌ invalide"})
                 continue
 
             lat, lon, disp = g
-            job_rows.append({"ID": job_id, "Intervention": name, "Adresse saisie": addr, "Statut": "✅ OK", "Adresse résolue": disp})
+            job_rows.append({"ID": job_id, "Intervention": name, "Statut": "✅ OK", "Adresse résolue": disp,
+                             "HO/HNO": ho_mode, "Priorité": prio, "SLA(h)": "" if deadline is None else round(deadline/60.0, 2)})
             job_rows[-1]["_lat"] = lat
             job_rows[-1]["_lon"] = lon
             job_rows[-1]["_dur"] = dur
@@ -556,7 +555,7 @@ with right:
         st.dataframe(pd.DataFrame(job_rows), use_container_width=True, hide_index=True)
 
     if bad_tech or bad_jobs:
-        st.error("Certaines adresses sont invalides. Corrige-les puis relance l’optimisation.")
+        st.error("Certaines adresses sont invalides. Corrige-les puis relance.")
         if bad_tech:
             st.dataframe(pd.DataFrame(bad_tech), use_container_width=True, hide_index=True)
         if bad_jobs:
@@ -568,55 +567,64 @@ with right:
     # -----------------------------------------------------
     techs: List[Tech] = []
     for r in tech_rows:
-        techs.append(
-            Tech(
-                tech_id=r["ID"],
-                name=r["Tech"],
-                address_input=r["Adresse saisie"],
-                address_resolved=r.get("Adresse résolue", r["Adresse saisie"]),
-                lat=r["_lat"],
-                lon=r["_lon"],
-                max_minutes=r["_max_min"],
-                skills=r["_skills"],
-            )
-        )
+        techs.append(Tech(
+            tech_id=r["ID"],
+            name=r["Tech"],
+            address_input=next((x for x in techs_df[techs_df["ID"] == r["ID"]]["Adresse agence"].tolist()), ""),
+            address_resolved=r.get("Adresse résolue", ""),
+            lat=r["_lat"], lon=r["_lon"],
+            max_minutes=r["_max_min"],
+            chain_jobs=r["_chain"],
+            return_end=r["_return_end"],
+            skills=r["_skills"],
+        ))
 
     jobs: List[Job] = []
     for r in job_rows:
-        jobs.append(
-            Job(
-                job_id=r["ID"],
-                name=r["Intervention"],
-                address_input=r["Adresse saisie"],
-                address_resolved=r.get("Adresse résolue", r["Adresse saisie"]),
-                lat=r["_lat"],
-                lon=r["_lon"],
-                service_min=r["_dur"],
-                required_skills=r["_req_skills"],
-                deadline_min=r["_deadline"],
-                priority=r["_prio"],
-                ho_mode=r["_ho"],
-            )
-        )
+        jobs.append(Job(
+            job_id=r["ID"],
+            name=r["Intervention"],
+            address_input=next((x for x in jobs_df[jobs_df["ID"] == r["ID"]]["Adresse"].tolist()), ""),
+            address_resolved=r.get("Adresse résolue", ""),
+            lat=r["_lat"], lon=r["_lon"],
+            service_min=r["_dur"],
+            required_skills=r["_req_skills"],
+            deadline_min=r["_deadline"],
+            priority=r["_prio"],
+            ho_mode=r["_ho"],
+        ))
 
     # -----------------------------------------------------
-    # Build nodes: start per tech + end per tech + jobs
+    # Nodes:
+    # start per tech (agency)
+    # end per tech: if return_end=True -> agency end node, else -> virtual end node
+    # + jobs nodes
+    # + virtual end nodes (one per tech) placed at same coords as agency (only for matrix)
     # -----------------------------------------------------
     coords: List[Tuple[float, float]] = []
     service_min: List[int] = []
     starts: List[int] = []
-    ends: List[int] = []
 
+    # start nodes
     for t in techs:
         starts.append(len(coords))
         coords.append((t.lat, t.lon))
         service_min.append(0)
 
+    # end nodes — we will create either agency end node or virtual end node
+    ends: List[int] = []
+    # keep mapping per vehicle
+    end_is_virtual: List[bool] = []
+
+    # create ends now:
     for t in techs:
         ends.append(len(coords))
-        coords.append((t.lat, t.lon))
+        coords.append((t.lat, t.lon))  # same coord
         service_min.append(0)
+        # mark virtual or not (we'll use it in cost callback via big matrix tweak)
+        end_is_virtual.append(not t.return_end)
 
+    # job nodes
     job_offset = len(coords)
     job_nodes: List[int] = []
     for j in jobs:
@@ -625,7 +633,24 @@ with right:
         service_min.append(int(j.service_min))
 
     # -----------------------------------------------------
-    # Constraints: skills + time windows + SLA
+    # Build matrix
+    # -----------------------------------------------------
+    with st.spinner("Calcul des temps de trajet (OSRM)…"):
+        tm = osrm_table_minutes(coords)
+
+    # -----------------------------------------------------
+    # If end is virtual, we want travel cost to end to be zero from any node (finish anywhere)
+    # We do that by forcing tm[f][end_node] = 0 for all f, for that vehicle’s end node.
+    # Time dimension uses tm too, so we set to 0 for time as well (finish anywhere without extra travel).
+    # -----------------------------------------------------
+    for v, isvirt in enumerate(end_is_virtual):
+        if isvirt:
+            end_node = ends[v]
+            for f in range(len(tm)):
+                tm[f][end_node] = 0  # finish anywhere with no added travel
+
+    # -----------------------------------------------------
+    # Constraints: skills, HO/HNO, SLA, priorities
     # -----------------------------------------------------
     allowed_vehicles: Dict[int, List[int]] = {}
     job_time_windows: Dict[int, Tuple[int, int]] = {}
@@ -638,13 +663,13 @@ with right:
             start_min=start_min,
             open_start_min=open_start_min,
             open_end_min=open_end_min,
-            horizon_min=horizon_min,
+            horizon_min=min(1440, horizon_hours * 60),
         )
         if tw is None:
             if allow_drop:
-                job_time_windows[int(node)] = (start_min, horizon_min)
+                job_time_windows[int(node)] = (start_min, min(1440, horizon_hours * 60))
             else:
-                st.error(f"'{job.name}' est impossible aujourd’hui avec HO/HNO + heure de départ. Active 'report' ou change l’heure.")
+                st.error(f"'{job.name}' impossible aujourd’hui avec HO/HNO + heure de départ. Active report ou change l’heure.")
                 st.stop()
         else:
             job_time_windows[int(node)] = (int(tw[0]), int(tw[1]))
@@ -662,19 +687,28 @@ with right:
         if not ok:
             st.error(
                 f"Aucun technicien compatible pour '{job.name}'. "
-                f"Skills requis={sorted(job.required_skills)}. "
-                f"➡️ Assigne ces skills à au moins un technicien via menus."
+                f"Skills requis={sorted(job.required_skills)}."
             )
             st.stop()
 
         allowed_vehicles[int(node)] = [int(v) for v in ok]
 
-    # -----------------------------------------------------
-    # Time matrix + Solve
-    # -----------------------------------------------------
-    with st.spinner("Calcul des temps de trajet (OSRM)…"):
-        tm = osrm_table_minutes(coords)
+    # Flags nodes for "return between jobs" restriction
+    n_nodes = len(tm)
+    is_depot_node = [False] * n_nodes
+    is_job_node = [False] * n_nodes
 
+    # depot nodes are starts and ends (they represent the agency)
+    for s in starts:
+        is_depot_node[s] = True
+    for e in ends:
+        is_depot_node[e] = True
+    for jn in job_nodes:
+        is_job_node[jn] = True
+
+    # -----------------------------------------------------
+    # Solve
+    # -----------------------------------------------------
     with st.spinner("Optimisation (OR-Tools)…"):
         sol = solve_vrp_multi_tech(
             tm_min=tm,
@@ -689,10 +723,12 @@ with right:
             priority_by_node=priority_by_node,
             allow_drop=allow_drop,
             time_limit_s=int(time_limit),
+            is_depot_node=is_depot_node,
+            is_job_node=is_job_node,
         )
 
     if sol is None:
-        st.error("Aucune solution faisable. ➡️ augmente heures max / assouplis SLA / ajoute un tech / active report.")
+        st.error("Aucune solution faisable. ➜ augmente heures max / assouplis SLA / ajoute un tech / active report.")
         st.stop()
 
     dropped = sol["dropped"]
@@ -706,9 +742,11 @@ with right:
     def label(node: int) -> str:
         node = int(node)
         if node < len(techs):
-            return f"Départ {techs[node].name}"
+            return f"Agence départ {techs[node].name}"
         if len(techs) <= node < 2 * len(techs):
-            return f"Retour {techs[node - len(techs)].name}"
+            # end node (agency or virtual)
+            v = node - len(techs)
+            return "Fin libre" if end_is_virtual[v] else f"Retour agence {techs[v].name}"
         return jobs[node - job_offset].name
 
     assign_rows = []
@@ -716,12 +754,14 @@ with right:
 
     for r in sol["routes"]:
         tech_name = r["tech"]
+        v = r["vehicle"]
         nodes_route = r["nodes"]
         end_time = r["end_time_min"]
         max_min = r["max_min"]
 
         route_jobs = []
         route_latlon = []
+
         for n in nodes_route:
             n = int(n)
             route_latlon.append(coords[n])
@@ -732,6 +772,8 @@ with right:
                     "Intervention": jb.name,
                     "ID": jb.job_id,
                     "Technicien": tech_name,
+                    "Enchaîner ?": "OUI" if techs[v].chain_jobs else "NON",
+                    "Retour fin ?": "OUI" if techs[v].return_end else "NON",
                     "HO/HNO": jb.ho_mode,
                     "Priorité": jb.priority,
                     "SLA(h)": "" if jb.deadline_min is None else round(jb.deadline_min/60.0, 2),
@@ -740,7 +782,11 @@ with right:
 
         routes_for_map.append((tech_name, route_latlon))
 
-        with st.expander(f"{tech_name} — {len(route_jobs)} interventions — fin {end_time} min (max {max_min} min)", expanded=True):
+        with st.expander(
+            f"{tech_name} — {len(route_jobs)} interventions — fin {end_time} min (max {max_min} min) "
+            f"| Enchaîner={'OUI' if techs[v].chain_jobs else 'NON'} | Retour fin={'OUI' if techs[v].return_end else 'NON'}",
+            expanded=True
+        ):
             if not route_jobs:
                 st.write("Aucune intervention affectée.")
             else:
@@ -781,13 +827,15 @@ with right:
 
         m = folium.Map(location=center, zoom_start=11, control_scale=True)
 
+        # agency markers
         for t in techs:
             folium.Marker(
                 location=(t.lat, t.lon),
-                tooltip=f"Départ {t.name} ({t.tech_id})",
+                tooltip=f"Agence {t.name} ({t.tech_id})",
                 icon=folium.Icon(icon="home", prefix="fa"),
             ).add_to(m)
 
+        # jobs markers
         for j in jobs:
             folium.CircleMarker(
                 location=(j.lat, j.lon),
@@ -796,6 +844,7 @@ with right:
                 fill=True,
             ).add_to(m)
 
+        # polylines (simple)
         for tech_name, latlon_list in routes_for_map:
             poly = [(lat, lon) for (lat, lon) in latlon_list]
             folium.PolyLine(poly, tooltip=f"Tournée {tech_name}").add_to(m)
