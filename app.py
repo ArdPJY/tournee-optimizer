@@ -1,5 +1,4 @@
 import time
-import math
 import requests
 import pandas as pd
 import streamlit as st
@@ -8,111 +7,194 @@ from typing import List, Optional, Tuple
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
+
 # -----------------------------
-# Config UI
+# UI
 # -----------------------------
-st.set_page_config(page_title="Optimisation tournée technicien", layout="wide")
-st.title("Optimisation de tournée (OSM) — avec calcul d’économies")
+st.set_page_config(page_title="Optimisation tournées multi-techniciens (OSM)", layout="wide")
+st.title("Optimisation tournées multi-techniciens (OSM/OSRM) — affectation + ordre + budgets")
 
 st.caption(
-    "Saisis une agence (départ/retour) + des interventions (nom, adresse, durée). "
-    "L’app compare le temps **Avant** (ordre saisi) vs **Après** (ordre optimisé) et explique le gain."
+    "Sans Google : géocodage via OpenStreetMap (Nominatim) + temps de trajet OSRM. "
+    "Le solveur assigne les interventions aux techniciens et calcule l’ordre optimal, "
+    "avec des plafonds par technicien (en € ou h ou minutes)."
 )
 
+
 # -----------------------------
-# Modèles
+# Data models
 # -----------------------------
 @dataclass
-class Stop:
+class Tech:
     name: str
     address_input: str
     address_resolved: str
     lat: float
     lon: float
-    service_minutes: int = 0
+    rate_cents_per_min: int
+    max_work_min: int  # plafond en minutes (trajet+service)
+
+
+@dataclass
+class Job:
+    name: str
+    address_input: str
+    address_resolved: str
+    lat: float
+    lon: float
+    service_min: int
+
 
 # -----------------------------
-# Géocodage OSM (Nominatim)
+# Geocoding (OSM Nominatim)
 # -----------------------------
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
-def geocode_address_osm(address: str) -> Optional[Tuple[float, float, str]]:
-    """
-    Retourne (lat, lon, display_name) via Nominatim.
-    """
+def geocode_osm(address: str) -> Optional[Tuple[float, float, str]]:
     if not address or not address.strip():
         return None
-
     headers = {
-        "User-Agent": "tournee-optimizer-streamlit/1.0 (contact: internal)",
+        "User-Agent": "tournee-optimizer/1.0 (internal)",
         "Accept-Language": "fr",
     }
     params = {"q": address, "format": "json", "limit": 1}
-
     r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
     r.raise_for_status()
     data = r.json()
     if not data:
         return None
-
     lat = float(data[0]["lat"])
     lon = float(data[0]["lon"])
     disp = data[0].get("display_name", address)
     return lat, lon, disp
 
+
 # -----------------------------
-# Matrice de temps OSRM
+# OSRM time matrix (minutes)
 # -----------------------------
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def osrm_table_minutes(coords: List[Tuple[float, float]]) -> List[List[int]]:
-    """
-    coords: liste de (lat, lon)
-    Retourne matrice [i][j] en minutes.
-    """
     if len(coords) < 2:
         return [[0]]
-
     coord_str = ";".join([f"{lon},{lat}" for (lat, lon) in coords])
     url = OSRM_TABLE_URL + coord_str
     r = requests.get(url, params={"annotations": "duration"}, timeout=30)
     r.raise_for_status()
-    durations = r.json()["durations"]  # secondes
+    durations = r.json()["durations"]  # seconds
     return [[int(round((d or 0) / 60.0)) for d in row] for row in durations]
 
-# -----------------------------
-# OR-Tools optimisation
-# -----------------------------
-def solve_route(
-    time_matrix_minutes: List[List[int]],
-    service_minutes: List[int],
-    start_index: int,
-    end_index: int,
-    time_limit_s: int = 5,
-) -> Optional[Tuple[List[int], int]]:
-    """
-    Minimise (trajet + service à l’arrivée).
-    Retourne (route_indices, total_minutes).
-    """
-    n = len(time_matrix_minutes)
-    if n == 0:
-        return None
-    if n == 1:
-        return [0], service_minutes[0]
 
-    manager = pywrapcp.RoutingIndexManager(n, 1, [start_index], [end_index])
+# -----------------------------
+# Unit conversion helpers
+# -----------------------------
+RATE_UNITS = ["€/h", "€/jour (8h)"]
+CAP_UNITS = ["€", "h", "min"]
+
+def rate_to_cents_per_min(rate_value: float, unit: str) -> int:
+    """
+    Convertit un taux en centimes/min.
+    - €/h : rate_value € / heure
+    - €/jour (8h) : rate_value € / jour -> 8h
+    """
+    if rate_value < 0:
+        rate_value = 0
+    if unit == "€/h":
+        euros_per_min = rate_value / 60.0
+    elif unit == "€/jour (8h)":
+        euros_per_min = rate_value / (8.0 * 60.0)
+    else:
+        euros_per_min = rate_value / 60.0
+    return int(round(euros_per_min * 100))
+
+def cap_to_max_minutes(cap_value: float, cap_unit: str, rate_cents_per_min: int) -> int:
+    """
+    Convertit le plafond en minutes max (trajet+service).
+    - € : convertit en minutes via le taux
+    - h : convertit en minutes
+    - min : direct
+    """
+    if cap_value < 0:
+        cap_value = 0
+
+    if cap_unit == "min":
+        return int(round(cap_value))
+    if cap_unit == "h":
+        return int(round(cap_value * 60))
+
+    # cap en €
+    # minutes = cap_euros / euros_per_min
+    euros_per_min = max(rate_cents_per_min, 1) / 100.0
+    return int(round(cap_value / euros_per_min))
+
+
+# -----------------------------
+# VRP solver (multi-tech)
+# -----------------------------
+def solve_multi_tech_vrp(
+    time_matrix_min: List[List[int]],
+    service_min: List[int],
+    techs: List[Tech],
+    starts: List[int],
+    ends: List[int],
+    time_limit_s: int = 10,
+):
+    """
+    Optimise :
+    - affectation jobs -> tech
+    - ordre de visite
+    - objectif : minimiser coût total (temps * taux tech)
+    - contrainte : minutes totales (trajet+service) <= max_work_min par tech
+    """
+    n = len(time_matrix_min)
+    num_vehicles = len(techs)
+
+    manager = pywrapcp.RoutingIndexManager(n, num_vehicles, starts, ends)
     routing = pywrapcp.RoutingModel(manager)
 
-    def transit(from_i: int, to_i: int) -> int:
+    # 1) Coût (objectif) dépend du véhicule : minutes * rate_cents_per_min
+    cost_callbacks = []
+    for v in range(num_vehicles):
+        rate = techs[v].rate_cents_per_min
+
+        def make_cost_cb(rate_cents):
+            def cb(from_i, to_i):
+                f = manager.IndexToNode(from_i)
+                t = manager.IndexToNode(to_i)
+                minutes = time_matrix_min[f][t] + service_min[t]
+                return int(minutes * rate_cents)
+            return cb
+
+        cb_index = routing.RegisterTransitCallback(make_cost_cb(rate))
+        routing.SetArcCostEvaluatorOfVehicle(cb_index, v)
+        cost_callbacks.append(cb_index)
+
+    # 2) Dimension "Work" en minutes (trajet+service), contrainte par tech
+    #    Ici on met un transit callback en minutes (pas en €)
+    def work_minutes_cb(from_i, to_i):
         f = manager.IndexToNode(from_i)
         t = manager.IndexToNode(to_i)
-        return time_matrix_minutes[f][t] + service_minutes[t]
+        return int(time_matrix_min[f][t] + service_min[t])
 
-    cb = routing.RegisterTransitCallback(transit)
-    routing.SetArcCostEvaluatorOfAllVehicles(cb)
+    work_cb_idx = routing.RegisterTransitCallback(work_minutes_cb)
 
+    routing.AddDimension(
+        work_cb_idx,
+        0,               # slack
+        10**9,           # capacity temporaire (on fixe par vehicle après)
+        True,            # start cumul to zero
+        "Work"
+    )
+    work_dim = routing.GetDimensionOrDie("Work")
+
+    for v, tech in enumerate(techs):
+        end_idx = routing.End(v)
+        # borne max au nœud de fin
+        work_dim.CumulVar(end_idx).SetMax(tech.max_work_min)
+
+    # Paramètres de recherche
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -122,307 +204,311 @@ def solve_route(
     if sol is None:
         return None
 
-    route = []
-    idx = routing.Start(0)
-    total = 0
-    while not routing.IsEnd(idx):
-        node = manager.IndexToNode(idx)
-        route.append(node)
-        nxt = sol.Value(routing.NextVar(idx))
-        nxt_node = manager.IndexToNode(nxt)
-        if not routing.IsEnd(nxt):
-            total += time_matrix_minutes[node][nxt_node] + service_minutes[nxt_node]
-        idx = nxt
-    route.append(manager.IndexToNode(idx))
-    return route, total
+    # Extraction des routes
+    routes = []
+    total_cost_cents = 0
+
+    for v in range(num_vehicles):
+        idx = routing.Start(v)
+        route_nodes = []
+        route_cost_cents = 0
+        route_work_min = 0
+
+        while not routing.IsEnd(idx):
+            node = manager.IndexToNode(idx)
+            route_nodes.append(node)
+            nxt = sol.Value(routing.NextVar(idx))
+            nxt_node = manager.IndexToNode(nxt)
+
+            if not routing.IsEnd(nxt):
+                minutes = time_matrix_min[node][nxt_node] + service_min[nxt_node]
+                route_work_min += minutes
+                route_cost_cents += minutes * techs[v].rate_cents_per_min
+
+            idx = nxt
+
+        route_nodes.append(manager.IndexToNode(idx))
+        total_cost_cents += route_cost_cents
+
+        routes.append({
+            "vehicle": v,
+            "tech_name": techs[v].name,
+            "nodes": route_nodes,
+            "work_min": route_work_min,
+            "cost_cents": int(route_cost_cents),
+            "max_work_min": techs[v].max_work_min
+        })
+
+    return {
+        "routes": routes,
+        "total_cost_cents": int(total_cost_cents)
+    }
+
 
 # -----------------------------
-# Calcul "Avant" (ordre saisi)
+# UI inputs
 # -----------------------------
-def compute_baseline_total(route_idx: List[int], tm: List[List[int]], service: List[int]) -> Tuple[int, int, int]:
-    """
-    Calcule:
-      total = sum(trajets) + sum(service à l’arrivée) pour une route donnée.
-    Retourne (total, travel_total, service_total)
-    """
-    travel_total = 0
-    service_total = 0
-    for a, b in zip(route_idx[:-1], route_idx[1:]):
-        travel_total += tm[a][b]
-        service_total += service[b]
-    return travel_total + service_total, travel_total, service_total
+left, right = st.columns([1.05, 1.95])
 
-def explain_savings(before_route_idx: List[int], after_route_idx: List[int], tm: List[List[int]], stops: List[Stop]) -> str:
-    """
-    Explication simple et concrète du gain :
-    - distance "ligne droite" remplacée par trajets plus cohérents
-    - moins d’allers-retours / zigzag
-    On quantifie un indicateur : nombre de "grands sauts" (trajets longs) réduit.
-    """
-    def leg_minutes(route_idx):
-        return [tm[a][b] for a, b in zip(route_idx[:-1], route_idx[1:])]
+with left:
+    st.subheader("1) Techniciens")
+    st.write("Ajoute autant de techniciens que nécessaire (adresse de départ + taux + plafond).")
 
-    before_legs = leg_minutes(before_route_idx)
-    after_legs = leg_minutes(after_route_idx)
+    if "techs_df" not in st.session_state:
+        st.session_state.techs_df = pd.DataFrame([
+            {"Tech": "Tech 1", "Adresse départ": "", "Taux": 60, "Unité taux": "€/h", "Plafond": 8, "Unité plafond": "h"},
+            {"Tech": "Tech 2", "Adresse départ": "", "Taux": 55, "Unité taux": "€/h", "Plafond": 350, "Unité plafond": "€"},
+        ])
 
-    if not before_legs or not after_legs:
-        return "Gain expliqué : la route optimisée réduit les détours et regroupe les points proches."
-
-    # seuil "grand saut": top 25% des trajets avant (si possible)
-    sorted_before = sorted(before_legs)
-    threshold = sorted_before[int(max(0, math.floor(0.75 * (len(sorted_before)-1))))]  # approx quantile 75%
-    big_before = sum(1 for x in before_legs if x >= threshold)
-    big_after = sum(1 for x in after_legs if x >= threshold)
-
-    # Variation zigzag : somme des “pics” (legs très au-dessus de la médiane)
-    med = sorted_before[len(sorted_before)//2]
-    spikes_before = sum(max(0, x - med) for x in before_legs)
-    spikes_after = sum(max(0, x - med) for x in after_legs)
-
-    pieces = []
-    pieces.append(
-        "Pourquoi tu économises du temps : l’optimisation change l’ordre des visites pour limiter les détours. "
-        "Au lieu de ‘zigzaguer’ entre des zones éloignées, le solveur regroupe les interventions proches géographiquement."
+    techs_df = st.data_editor(
+        st.session_state.techs_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Tech": st.column_config.TextColumn(required=True),
+            "Adresse départ": st.column_config.TextColumn(required=True),
+            "Taux": st.column_config.NumberColumn(min_value=0.0, step=1.0, required=True),
+            "Unité taux": st.column_config.SelectboxColumn(options=RATE_UNITS, required=True),
+            "Plafond": st.column_config.NumberColumn(min_value=0.0, step=1.0, required=True),
+            "Unité plafond": st.column_config.SelectboxColumn(options=CAP_UNITS, required=True),
+        }
     )
-
-    if big_after < big_before:
-        pieces.append(
-            f"Concrètement, la tournée optimisée réduit les ‘grands sauts’ (trajets longs) : "
-            f"{big_before} → {big_after}. Ça évite des allers-retours inutiles."
-        )
-    else:
-        pieces.append(
-            "Concrètement, la tournée optimisée cherche à réduire les trajets les plus pénalisants en temps "
-            "(ceux qui créent les plus gros détours)."
-        )
-
-    if spikes_after < spikes_before:
-        pieces.append(
-            f"On voit aussi moins de ‘pics de trajet’ (détours) : l’excès par rapport à un trajet typique diminue "
-            f"({spikes_before} → {spikes_after} min cumulés)."
-        )
-
-    pieces.append(
-        "Important : le **temps d’intervention sur site** ne change pas (tu fais les mêmes jobs). "
-        "Le gain vient quasi exclusivement du **temps de déplacement**."
-    )
-
-    return "\n\n".join(pieces)
-
-# -----------------------------
-# UI
-# -----------------------------
-colA, colB = st.columns([1, 2])
-
-with colA:
-    st.subheader("1) Agence (départ / retour)")
-    agency_name = st.text_input("Nom agence", value="Agence")
-    agency_address = st.text_input("Adresse agence", value="")
+    st.session_state.techs_df = techs_df
 
     st.subheader("2) Interventions")
-    st.write("Ajoute des lignes, puis remplis Nom + Adresse + Durée (min). L’ordre des lignes = l’ordre ‘Avant’.")
+    st.write("Ordre des lignes = ordre initial (référence), mais ici l’objectif est surtout l’affectation + tournée.")
 
     if "jobs_df" not in st.session_state:
-        st.session_state.jobs_df = pd.DataFrame(
-            [
-                {"Nom": "Intervention 1", "Adresse": "", "Durée (min)": 30},
-                {"Nom": "Intervention 2", "Adresse": "", "Durée (min)": 45},
-            ]
-        )
+        st.session_state.jobs_df = pd.DataFrame([
+            {"Intervention": "Job 1", "Adresse": "", "Durée (min)": 30},
+            {"Intervention": "Job 2", "Adresse": "", "Durée (min)": 45},
+        ])
 
-    edited_df = st.data_editor(
+    jobs_df = st.data_editor(
         st.session_state.jobs_df,
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Nom": st.column_config.TextColumn(required=True),
+            "Intervention": st.column_config.TextColumn(required=True),
             "Adresse": st.column_config.TextColumn(required=True),
             "Durée (min)": st.column_config.NumberColumn(min_value=0, step=5, required=True),
-        },
+        }
     )
-    st.session_state.jobs_df = edited_df
+    st.session_state.jobs_df = jobs_df
 
     c1, c2 = st.columns(2)
     with c1:
-        return_to_agency = st.checkbox("Retour à l'agence en fin de tournée", value=True)
+        return_to_start = st.checkbox("Retour au point de départ pour chaque tech", value=True)
     with c2:
-        time_limit = st.slider("Temps de calcul max (s)", 1, 15, 5)
+        time_limit = st.slider("Temps de calcul max (s)", 3, 30, 10)
 
-    optimize = st.button("🚀 Optimiser + calculer économies", type="primary")
+    run = st.button("🚀 Optimiser affectation + tournées", type="primary")
 
-with colB:
-    st.subheader("Résultat")
-    if not optimize:
-        st.info("Renseigne l'agence + au moins 1 intervention, puis clique sur **Optimiser + calculer économies**.")
+
+with right:
+    st.subheader("Résultats")
+
+    if not run:
+        st.info("Renseigne des techniciens + des interventions, puis clique sur **Optimiser**.")
         st.stop()
 
-    # Validation
-    jobs_df = st.session_state.jobs_df.copy().dropna(subset=["Nom", "Adresse", "Durée (min)"])
-    jobs_df["Nom"] = jobs_df["Nom"].astype(str)
-    jobs_df["Adresse"] = jobs_df["Adresse"].astype(str)
+    # Clean input data
+    techs_df = st.session_state.techs_df.copy().dropna(subset=["Tech", "Adresse départ", "Taux", "Unité taux", "Plafond", "Unité plafond"])
+    jobs_df = st.session_state.jobs_df.copy().dropna(subset=["Intervention", "Adresse", "Durée (min)"])
 
-    if not agency_address.strip():
-        st.error("Adresse agence manquante.")
+    if len(techs_df) == 0:
+        st.error("Ajoute au moins 1 technicien.")
         st.stop()
     if len(jobs_df) == 0:
-        st.error("Ajoute au moins une intervention.")
+        st.error("Ajoute au moins 1 intervention.")
         st.stop()
 
-    # Géocodage agence
-    with st.spinner("Géocodage agence (OSM) ..."):
-        g = geocode_address_osm(agency_address.strip())
-    if g is None:
-        st.error("Impossible de géocoder l'adresse de l'agence (OSM). Ajoute ville + code postal + France.")
+    # Geocode techs
+    techs: List[Tech] = []
+    bad_tech = []
+    with st.spinner("Géocodage techniciens (OSM) ..."):
+        for _, row in techs_df.iterrows():
+            name = str(row["Tech"]).strip()
+            addr = str(row["Adresse départ"]).strip()
+            rate_val = float(row["Taux"])
+            rate_unit = str(row["Unité taux"])
+            cap_val = float(row["Plafond"])
+            cap_unit = str(row["Unité plafond"])
+
+            g = geocode_osm(addr)
+            if g is None:
+                bad_tech.append((name, addr))
+                continue
+            lat, lon, disp = g
+
+            rate_cents_min = rate_to_cents_per_min(rate_val, rate_unit)
+            max_work_min = cap_to_max_minutes(cap_val, cap_unit, rate_cents_min)
+
+            techs.append(Tech(
+                name=name,
+                address_input=addr,
+                address_resolved=disp,
+                lat=lat,
+                lon=lon,
+                rate_cents_per_min=rate_cents_min,
+                max_work_min=max_work_min
+            ))
+            time.sleep(0.1)
+
+    if bad_tech:
+        st.error("Techniciens non géocodés (adresse invalide). Ajoute ville + CP + France.")
+        st.dataframe(pd.DataFrame(bad_tech, columns=["Tech", "Adresse départ"]), use_container_width=True)
         st.stop()
 
-    a_lat, a_lon, a_disp = g
-    agency_stop = Stop(
-        name=f"{agency_name} (Départ)",
-        address_input=agency_address.strip(),
-        address_resolved=a_disp,
-        lat=a_lat,
-        lon=a_lon,
-        service_minutes=0,
-    )
-
-    # Géocodage interventions
-    stops_jobs: List[Stop] = []
-    bad = []
+    # Geocode jobs
+    jobs: List[Job] = []
+    bad_jobs = []
     with st.spinner("Géocodage interventions (OSM) ..."):
-        for i, row in jobs_df.iterrows():
-            name = row["Nom"].strip()
-            addr = row["Adresse"].strip()
+        for _, row in jobs_df.iterrows():
+            name = str(row["Intervention"]).strip()
+            addr = str(row["Adresse"]).strip()
             dur = int(row["Durée (min)"])
 
-            gg = geocode_address_osm(addr)
-            if gg is None:
-                bad.append((name, addr))
+            g = geocode_osm(addr)
+            if g is None:
+                bad_jobs.append((name, addr))
                 continue
-            lat, lon, disp = gg
-            stops_jobs.append(Stop(name=name, address_input=addr, address_resolved=disp, lat=lat, lon=lon, service_minutes=dur))
-            time.sleep(0.1)  # doux pour Nominatim
+            lat, lon, disp = g
+            jobs.append(Job(
+                name=name,
+                address_input=addr,
+                address_resolved=disp,
+                lat=lat,
+                lon=lon,
+                service_min=dur
+            ))
+            time.sleep(0.1)
 
-    if bad:
-        st.warning("Certaines adresses n’ont pas été géocodées (OSM). Ajoute ville + CP + France.")
-        st.write(pd.DataFrame(bad, columns=["Nom", "Adresse"]))
-
-    if len(stops_jobs) == 0:
-        st.error("Aucune intervention géocodée correctement.")
+    if bad_jobs:
+        st.error("Certaines interventions n’ont pas été géocodées. Ajoute ville + CP + France.")
+        st.dataframe(pd.DataFrame(bad_jobs, columns=["Intervention", "Adresse"]), use_container_width=True)
         st.stop()
 
-    # Construire stops (avec end agence distinct si retour)
-    if return_to_agency:
-        agency_end = Stop(
-            name=f"{agency_name} (Retour)",
-            address_input=agency_address.strip(),
-            address_resolved=a_disp,
-            lat=a_lat,
-            lon=a_lon,
-            service_minutes=0,
-        )
-        stops_all = [agency_stop] + stops_jobs + [agency_end]
-        start_index = 0
-        end_index = len(stops_all) - 1
+    # Build nodes:
+    # For VRP multi-start, simplest: create one start node per tech.
+    # End node per tech = same as start if retour demandé (we duplicate end nodes to avoid ambiguity).
+    # Then job nodes.
+    start_nodes = []
+    end_nodes = []
+    nodes_latlon = []
+    service_min = []
+
+    # Start nodes
+    for t in techs:
+        start_nodes.append(len(nodes_latlon))
+        nodes_latlon.append((t.lat, t.lon))
+        service_min.append(0)
+
+    # End nodes (duplicate start coords if return)
+    if return_to_start:
+        for t in techs:
+            end_nodes.append(len(nodes_latlon))
+            nodes_latlon.append((t.lat, t.lon))
+            service_min.append(0)
     else:
-        st.warning("Sans retour agence non implémenté ici (je peux te l’ajouter). On force le retour pour le calcul.")
-        agency_end = Stop(
-            name=f"{agency_name} (Retour)",
-            address_input=agency_address.strip(),
-            address_resolved=a_disp,
-            lat=a_lat,
-            lon=a_lon,
-            service_minutes=0,
-        )
-        stops_all = [agency_stop] + stops_jobs + [agency_end]
-        start_index = 0
-        end_index = len(stops_all) - 1
+        # not implemented cleanly here; we force return for correctness
+        st.warning("Mode sans retour non activé dans cette version. On force le retour.")
+        for t in techs:
+            end_nodes.append(len(nodes_latlon))
+            nodes_latlon.append((t.lat, t.lon))
+            service_min.append(0)
 
-    coords = [(s.lat, s.lon) for s in stops_all]
-    service = [s.service_minutes for s in stops_all]
+    # Job nodes
+    job_start_index = len(nodes_latlon)
+    for j in jobs:
+        nodes_latlon.append((j.lat, j.lon))
+        service_min.append(j.service_min)
 
-    # Matrice OSRM
+    # time matrix
     with st.spinner("Calcul des temps de trajet (OSRM) ..."):
-        tm = osrm_table_minutes(coords)
+        tm = osrm_table_minutes(nodes_latlon)
 
-    # -----------------------------
-    # AVANT (ordre saisi)
-    #   start -> jobs dans l'ordre -> end
-    # -----------------------------
-    baseline_route_idx = [start_index] + list(range(1, 1 + len(stops_jobs))) + [end_index]
-    before_total, before_travel, before_service = compute_baseline_total(baseline_route_idx, tm, service)
+    # Starts/Ends indexes per vehicle
+    starts = start_nodes
+    ends = end_nodes
 
-    # -----------------------------
-    # APRÈS (optimisé)
-    # -----------------------------
-    with st.spinner("Optimisation (OR-Tools) ..."):
-        res = solve_route(tm, service, start_index, end_index, time_limit_s=time_limit)
+    # Solve
+    with st.spinner("Optimisation VRP (OR-Tools) ..."):
+        sol = solve_multi_tech_vrp(
+            time_matrix_min=tm,
+            service_min=service_min,
+            techs=techs,
+            starts=starts,
+            ends=ends,
+            time_limit_s=int(time_limit),
+        )
 
-    if res is None:
-        st.error("Aucune solution trouvée.")
+    if sol is None:
+        st.error(
+            "Aucune solution faisable avec ces plafonds. "
+            "➡️ Augmente un plafond, ajoute un technicien, ou réduis la charge."
+        )
         st.stop()
 
-    after_route_idx, after_total = res
-    after_total2, after_travel, after_service = compute_baseline_total(after_route_idx, tm, service)
+    total_cost_eur = sol["total_cost_cents"] / 100.0
+    st.success(f"Solution trouvée ✅ — Coût total estimé (trajet+service × taux): **{total_cost_eur:.2f} €**")
 
-    # (after_total et after_total2 devraient matcher ; on garde after_total2 comme contrôle)
-    after_total = after_total2
+    # Helper label for nodes
+    def node_label(i: int) -> str:
+        # start nodes
+        if i < len(techs):
+            return f"Départ {techs[i].name}"
+        # end nodes
+        if len(techs) <= i < len(techs) + len(techs):
+            return f"Retour {techs[i - len(techs)].name}"
+        # jobs
+        j_idx = i - (len(techs) + len(techs))
+        if 0 <= j_idx < len(jobs):
+            return f"{jobs[j_idx].name}"
+        return f"Node {i}"
 
-    # -----------------------------
-    # Gains
-    # -----------------------------
-    gain_total = before_total - after_total
-    gain_travel = before_travel - after_travel  # c'est ça qui explique le gain
-    gain_pct = (gain_total / before_total * 100.0) if before_total > 0 else 0.0
+    # Display routes per tech
+    st.markdown("### Tournées par technicien")
 
-    # Affichage synthèse
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Avant (total)", f"{before_total} min", help="Trajet + interventions, dans l’ordre saisi")
-    c2.metric("Après (total)", f"{after_total} min", help="Trajet + interventions, ordre optimisé")
-    c3.metric("Économie", f"{gain_total} min", f"{gain_pct:.1f} %")
+    for r in sol["routes"]:
+        tech = techs[r["vehicle"]]
+        route_nodes = r["nodes"]
+        # Extract only job nodes in route (for readability)
+        jobs_in_route = []
+        for n in route_nodes:
+            if n >= job_start_index:
+                j = jobs[n - job_start_index]
+                jobs_in_route.append(j)
 
-    # Détails trajet vs service (pour prouver le 'pourquoi')
-    st.markdown("### Détail Avant vs Après")
-    detail = pd.DataFrame(
-        [
-            {"": "Trajet", "Avant (min)": before_travel, "Après (min)": after_travel, "Gain (min)": gain_travel},
-            {"": "Interventions", "Avant (min)": before_service, "Après (min)": after_service, "Gain (min)": before_service - after_service},
-            {"": "TOTAL", "Avant (min)": before_total, "Après (min)": after_total, "Gain (min)": gain_total},
-        ]
-    )
-    st.dataframe(detail, use_container_width=True, hide_index=True)
+        work_min = r["work_min"]
+        cost_eur = r["cost_cents"] / 100.0
+        max_min = r["max_work_min"]
 
-    # Afficher les routes
-    st.markdown("### Ordre des visites")
+        with st.expander(f"{tech.name} — {len(jobs_in_route)} interventions — {work_min} min / plafond {max_min} min — {cost_eur:.2f} €", expanded=True):
+            if not jobs_in_route:
+                st.write("Aucune intervention affectée.")
+            else:
+                df = pd.DataFrame({
+                    "Ordre": list(range(1, len(jobs_in_route) + 1)),
+                    "Intervention": [j.name for j in jobs_in_route],
+                    "Adresse (OSM)": [j.address_resolved for j in jobs_in_route],
+                    "Durée sur site (min)": [j.service_min for j in jobs_in_route],
+                })
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
-    def route_table(route_idx: List[int], label: str) -> pd.DataFrame:
-        ordered = [stops_all[i] for i in route_idx]
-        return pd.DataFrame({
-            "Ordre": list(range(1, len(ordered) + 1)),
-            "Point": [s.name for s in ordered],
-            "Adresse (résolue OSM)": [s.address_resolved for s in ordered],
-            "Durée intervention (min)": [s.service_minutes for s in ordered],
-        })
+            # Show raw route labels
+            st.caption("Chemin (nœuds) : " + " → ".join(node_label(n) for n in route_nodes))
 
-    tab1, tab2 = st.tabs(["Avant (ordre saisi)", "Après (optimisé)"])
-    with tab1:
-        st.dataframe(route_table(baseline_route_idx, "Avant"), use_container_width=True, hide_index=True)
-    with tab2:
-        st.dataframe(route_table(after_route_idx, "Après"), use_container_width=True, hide_index=True)
-
-    # Explication concrète du gain
-    st.markdown("### Pourquoi tu économises ce temps (explication concrète)")
-    explanation = explain_savings(baseline_route_idx, after_route_idx, tm, stops_all)
-    st.write(explanation)
-
-    # Message très concret métier
-    if gain_total > 0:
-        st.success(
-            f"Conclusion : tu économises **{gain_total} min** principalement grâce à **{gain_travel} min** de trajets en moins. "
-            "Le temps sur site ne bouge pas : tu fais les mêmes interventions, mais dans un ordre plus logique."
-        )
-    elif gain_total == 0:
-        st.info("Conclusion : pas de gain mesurable sur ce jeu de données (ordre déjà proche de l’optimal).")
-    else:
-        st.warning("Conclusion : l’ordre saisi semble déjà meilleur que la solution trouvée (rare). Augmente le temps de calcul.")
-        
+    # Summary assignment table
+    st.markdown("### Synthèse d’affectation (intervention → technicien)")
+    assign_rows = []
+    for r in sol["routes"]:
+        tech = techs[r["vehicle"]].name
+        for n in r["nodes"]:
+            if n >= job_start_index:
+                j = jobs[n - job_start_index]
+                assign_rows.append({"Intervention": j.name, "Technicien": tech})
+    st.dataframe(pd.DataFrame(assign_rows).sort_values(["Technicien", "Intervention"]), use_container_width=True, hide_index=True)
+    
