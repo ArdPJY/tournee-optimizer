@@ -2,3 +2,5 @@ streamlit
 pandas
 requests
 ortools
+folium
+streamlit-folium
