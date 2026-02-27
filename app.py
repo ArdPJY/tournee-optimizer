@@ -511,4 +511,3 @@ with right:
                 j = jobs[n - job_start_index]
                 assign_rows.append({"Intervention": j.name, "Technicien": tech})
     st.dataframe(pd.DataFrame(assign_rows).sort_values(["Technicien", "Intervention"]), use_container_width=True, hide_index=True)
-    
