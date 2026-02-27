@@ -1,17 +1,5 @@
-# app.py
-# Streamlit app: saisie d'interventions (nom + adresse + durée) + optimisation tournée (OR-Tools)
-# - Géocodage: Nominatim (OpenStreetMap) gratuit (sans clé) -> lat/lon
-# - Temps de trajet: OSRM public gratuit -> matrice de durées
-#
-# ⚠️ Notes:
-# - Nominatim impose des limites (ne pas spammer). On met du cache + un User-Agent.
-# - OSRM public est pratique en POC, pas recommandé en prod (self-host si besoin).
-#
-# Lancer:
-#   pip install -r requirements.txt
-#   streamlit run app.py
-
 import time
+import math
 import requests
 import pandas as pd
 import streamlit as st
@@ -20,18 +8,16 @@ from typing import List, Optional, Tuple
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-
 # -----------------------------
 # Config UI
 # -----------------------------
 st.set_page_config(page_title="Optimisation tournée technicien", layout="wide")
-st.title("Optimisation de tournée (Technicien / Agence)")
+st.title("Optimisation de tournée (OSM) — avec calcul d’économies")
 
 st.caption(
-    "Saisis une agence (départ/retour), puis tes interventions. "
-    "Le bouton **Optimiser** calcule l'ordre optimal (temps trajet + temps d'intervention)."
+    "Saisis une agence (départ/retour) + des interventions (nom, adresse, durée). "
+    "L’app compare le temps **Avant** (ordre saisi) vs **Après** (ordre optimisé) et explique le gain."
 )
-
 
 # -----------------------------
 # Modèles
@@ -39,49 +25,44 @@ st.caption(
 @dataclass
 class Stop:
     name: str
-    address: str
+    address_input: str
+    address_resolved: str
     lat: float
     lon: float
     service_minutes: int = 0
 
-
 # -----------------------------
-# Géocodage (Nominatim)
+# Géocodage OSM (Nominatim)
 # -----------------------------
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
-def geocode_address(address: str) -> Optional[Tuple[float, float, str]]:
+def geocode_address_osm(address: str) -> Optional[Tuple[float, float, str]]:
     """
     Retourne (lat, lon, display_name) via Nominatim.
-    Cache 24h pour éviter de re-taper l'API.
     """
     if not address or not address.strip():
         return None
 
     headers = {
-        # Important pour Nominatim
         "User-Agent": "tournee-optimizer-streamlit/1.0 (contact: internal)",
         "Accept-Language": "fr",
     }
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1,
-    }
-    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=15)
+    params = {"q": address, "format": "json", "limit": 1}
+
+    r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=20)
     r.raise_for_status()
     data = r.json()
     if not data:
         return None
+
     lat = float(data[0]["lat"])
     lon = float(data[0]["lon"])
     disp = data[0].get("display_name", address)
-    return (lat, lon, disp)
-
+    return lat, lon, disp
 
 # -----------------------------
-# Matrice de temps (OSRM)
+# Matrice de temps OSRM
 # -----------------------------
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
 
@@ -90,22 +71,19 @@ def osrm_table_minutes(coords: List[Tuple[float, float]]) -> List[List[int]]:
     """
     coords: liste de (lat, lon)
     Retourne matrice [i][j] en minutes.
-    Cache 6h (POC).
     """
     if len(coords) < 2:
         return [[0]]
 
-    # OSRM attend lon,lat
     coord_str = ";".join([f"{lon},{lat}" for (lat, lon) in coords])
     url = OSRM_TABLE_URL + coord_str
-    r = requests.get(url, params={"annotations": "duration"}, timeout=20)
+    r = requests.get(url, params={"annotations": "duration"}, timeout=30)
     r.raise_for_status()
     durations = r.json()["durations"]  # secondes
     return [[int(round((d or 0) / 60.0)) for d in row] for row in durations]
 
-
 # -----------------------------
-# Optimisation OR-Tools
+# OR-Tools optimisation
 # -----------------------------
 def solve_route(
     time_matrix_minutes: List[List[int]],
@@ -115,14 +93,14 @@ def solve_route(
     time_limit_s: int = 5,
 ) -> Optional[Tuple[List[int], int]]:
     """
-    Minimise (temps trajet + temps service à l'arrivée).
-    Retour: (route_indices, total_minutes)
+    Minimise (trajet + service à l’arrivée).
+    Retourne (route_indices, total_minutes).
     """
     n = len(time_matrix_minutes)
     if n == 0:
         return None
     if n == 1:
-        return ([0], service_minutes[0])
+        return [0], service_minutes[0]
 
     manager = pywrapcp.RoutingIndexManager(n, 1, [start_index], [end_index])
     routing = pywrapcp.RoutingModel(manager)
@@ -158,9 +136,81 @@ def solve_route(
     route.append(manager.IndexToNode(idx))
     return route, total
 
+# -----------------------------
+# Calcul "Avant" (ordre saisi)
+# -----------------------------
+def compute_baseline_total(route_idx: List[int], tm: List[List[int]], service: List[int]) -> Tuple[int, int, int]:
+    """
+    Calcule:
+      total = sum(trajets) + sum(service à l’arrivée) pour une route donnée.
+    Retourne (total, travel_total, service_total)
+    """
+    travel_total = 0
+    service_total = 0
+    for a, b in zip(route_idx[:-1], route_idx[1:]):
+        travel_total += tm[a][b]
+        service_total += service[b]
+    return travel_total + service_total, travel_total, service_total
+
+def explain_savings(before_route_idx: List[int], after_route_idx: List[int], tm: List[List[int]], stops: List[Stop]) -> str:
+    """
+    Explication simple et concrète du gain :
+    - distance "ligne droite" remplacée par trajets plus cohérents
+    - moins d’allers-retours / zigzag
+    On quantifie un indicateur : nombre de "grands sauts" (trajets longs) réduit.
+    """
+    def leg_minutes(route_idx):
+        return [tm[a][b] for a, b in zip(route_idx[:-1], route_idx[1:])]
+
+    before_legs = leg_minutes(before_route_idx)
+    after_legs = leg_minutes(after_route_idx)
+
+    if not before_legs or not after_legs:
+        return "Gain expliqué : la route optimisée réduit les détours et regroupe les points proches."
+
+    # seuil "grand saut": top 25% des trajets avant (si possible)
+    sorted_before = sorted(before_legs)
+    threshold = sorted_before[int(max(0, math.floor(0.75 * (len(sorted_before)-1))))]  # approx quantile 75%
+    big_before = sum(1 for x in before_legs if x >= threshold)
+    big_after = sum(1 for x in after_legs if x >= threshold)
+
+    # Variation zigzag : somme des “pics” (legs très au-dessus de la médiane)
+    med = sorted_before[len(sorted_before)//2]
+    spikes_before = sum(max(0, x - med) for x in before_legs)
+    spikes_after = sum(max(0, x - med) for x in after_legs)
+
+    pieces = []
+    pieces.append(
+        "Pourquoi tu économises du temps : l’optimisation change l’ordre des visites pour limiter les détours. "
+        "Au lieu de ‘zigzaguer’ entre des zones éloignées, le solveur regroupe les interventions proches géographiquement."
+    )
+
+    if big_after < big_before:
+        pieces.append(
+            f"Concrètement, la tournée optimisée réduit les ‘grands sauts’ (trajets longs) : "
+            f"{big_before} → {big_after}. Ça évite des allers-retours inutiles."
+        )
+    else:
+        pieces.append(
+            "Concrètement, la tournée optimisée cherche à réduire les trajets les plus pénalisants en temps "
+            "(ceux qui créent les plus gros détours)."
+        )
+
+    if spikes_after < spikes_before:
+        pieces.append(
+            f"On voit aussi moins de ‘pics de trajet’ (détours) : l’excès par rapport à un trajet typique diminue "
+            f"({spikes_before} → {spikes_after} min cumulés)."
+        )
+
+    pieces.append(
+        "Important : le **temps d’intervention sur site** ne change pas (tu fais les mêmes jobs). "
+        "Le gain vient quasi exclusivement du **temps de déplacement**."
+    )
+
+    return "\n\n".join(pieces)
 
 # -----------------------------
-# UI - Saisie des données
+# UI
 # -----------------------------
 colA, colB = st.columns([1, 2])
 
@@ -170,7 +220,7 @@ with colA:
     agency_address = st.text_input("Adresse agence", value="")
 
     st.subheader("2) Interventions")
-    st.write("Ajoute des lignes, puis remplis Nom + Adresse + Durée (min).")
+    st.write("Ajoute des lignes, puis remplis Nom + Adresse + Durée (min). L’ordre des lignes = l’ordre ‘Avant’.")
 
     if "jobs_df" not in st.session_state:
         st.session_state.jobs_df = pd.DataFrame(
@@ -191,162 +241,188 @@ with colA:
             "Durée (min)": st.column_config.NumberColumn(min_value=0, step=5, required=True),
         },
     )
-
     st.session_state.jobs_df = edited_df
 
-    options = st.columns(2)
-    with options[0]:
+    c1, c2 = st.columns(2)
+    with c1:
         return_to_agency = st.checkbox("Retour à l'agence en fin de tournée", value=True)
-    with options[1]:
-        time_limit = st.slider("Temps de calcul max (s)", min_value=1, max_value=15, value=5)
+    with c2:
+        time_limit = st.slider("Temps de calcul max (s)", 1, 15, 5)
 
-    optimize = st.button("🚀 Optimiser la tournée", type="primary")
-
+    optimize = st.button("🚀 Optimiser + calculer économies", type="primary")
 
 with colB:
     st.subheader("Résultat")
-    st.write("L'ordre optimal s'affichera ici (avec temps total estimé).")
-
     if not optimize:
-        st.info("Renseigne l'agence + au moins 1 intervention, puis clique sur **Optimiser**.")
+        st.info("Renseigne l'agence + au moins 1 intervention, puis clique sur **Optimiser + calculer économies**.")
+        st.stop()
+
+    # Validation
+    jobs_df = st.session_state.jobs_df.copy().dropna(subset=["Nom", "Adresse", "Durée (min)"])
+    jobs_df["Nom"] = jobs_df["Nom"].astype(str)
+    jobs_df["Adresse"] = jobs_df["Adresse"].astype(str)
+
+    if not agency_address.strip():
+        st.error("Adresse agence manquante.")
+        st.stop()
+    if len(jobs_df) == 0:
+        st.error("Ajoute au moins une intervention.")
+        st.stop()
+
+    # Géocodage agence
+    with st.spinner("Géocodage agence (OSM) ..."):
+        g = geocode_address_osm(agency_address.strip())
+    if g is None:
+        st.error("Impossible de géocoder l'adresse de l'agence (OSM). Ajoute ville + code postal + France.")
+        st.stop()
+
+    a_lat, a_lon, a_disp = g
+    agency_stop = Stop(
+        name=f"{agency_name} (Départ)",
+        address_input=agency_address.strip(),
+        address_resolved=a_disp,
+        lat=a_lat,
+        lon=a_lon,
+        service_minutes=0,
+    )
+
+    # Géocodage interventions
+    stops_jobs: List[Stop] = []
+    bad = []
+    with st.spinner("Géocodage interventions (OSM) ..."):
+        for i, row in jobs_df.iterrows():
+            name = row["Nom"].strip()
+            addr = row["Adresse"].strip()
+            dur = int(row["Durée (min)"])
+
+            gg = geocode_address_osm(addr)
+            if gg is None:
+                bad.append((name, addr))
+                continue
+            lat, lon, disp = gg
+            stops_jobs.append(Stop(name=name, address_input=addr, address_resolved=disp, lat=lat, lon=lon, service_minutes=dur))
+            time.sleep(0.1)  # doux pour Nominatim
+
+    if bad:
+        st.warning("Certaines adresses n’ont pas été géocodées (OSM). Ajoute ville + CP + France.")
+        st.write(pd.DataFrame(bad, columns=["Nom", "Adresse"]))
+
+    if len(stops_jobs) == 0:
+        st.error("Aucune intervention géocodée correctement.")
+        st.stop()
+
+    # Construire stops (avec end agence distinct si retour)
+    if return_to_agency:
+        agency_end = Stop(
+            name=f"{agency_name} (Retour)",
+            address_input=agency_address.strip(),
+            address_resolved=a_disp,
+            lat=a_lat,
+            lon=a_lon,
+            service_minutes=0,
+        )
+        stops_all = [agency_stop] + stops_jobs + [agency_end]
+        start_index = 0
+        end_index = len(stops_all) - 1
     else:
-        # Validation
-        jobs_df = st.session_state.jobs_df.copy()
-        jobs_df = jobs_df.dropna(subset=["Nom", "Adresse", "Durée (min)"])
-        jobs_df["Nom"] = jobs_df["Nom"].astype(str)
-        jobs_df["Adresse"] = jobs_df["Adresse"].astype(str)
+        st.warning("Sans retour agence non implémenté ici (je peux te l’ajouter). On force le retour pour le calcul.")
+        agency_end = Stop(
+            name=f"{agency_name} (Retour)",
+            address_input=agency_address.strip(),
+            address_resolved=a_disp,
+            lat=a_lat,
+            lon=a_lon,
+            service_minutes=0,
+        )
+        stops_all = [agency_stop] + stops_jobs + [agency_end]
+        start_index = 0
+        end_index = len(stops_all) - 1
 
-        if not agency_address.strip():
-            st.error("Adresse agence manquante.")
-            st.stop()
+    coords = [(s.lat, s.lon) for s in stops_all]
+    service = [s.service_minutes for s in stops_all]
 
-        if len(jobs_df) == 0:
-            st.error("Ajoute au moins une intervention.")
-            st.stop()
+    # Matrice OSRM
+    with st.spinner("Calcul des temps de trajet (OSRM) ..."):
+        tm = osrm_table_minutes(coords)
 
-        # Géocodage agence
-        with st.spinner("Géocodage de l'agence..."):
-            try:
-                g = geocode_address(agency_address.strip())
-            except Exception as e:
-                st.error(f"Erreur géocodage agence: {e}")
-                st.stop()
+    # -----------------------------
+    # AVANT (ordre saisi)
+    #   start -> jobs dans l'ordre -> end
+    # -----------------------------
+    baseline_route_idx = [start_index] + list(range(1, 1 + len(stops_jobs))) + [end_index]
+    before_total, before_travel, before_service = compute_baseline_total(baseline_route_idx, tm, service)
 
-        if g is None:
-            st.error("Impossible de géocoder l'adresse de l'agence.")
-            st.stop()
+    # -----------------------------
+    # APRÈS (optimisé)
+    # -----------------------------
+    with st.spinner("Optimisation (OR-Tools) ..."):
+        res = solve_route(tm, service, start_index, end_index, time_limit_s=time_limit)
 
-        agency_lat, agency_lon, agency_disp = g
+    if res is None:
+        st.error("Aucune solution trouvée.")
+        st.stop()
 
-        # Géocodage interventions
-        stops_jobs: List[Stop] = []
-        bad_rows = []
-        with st.spinner("Géocodage des interventions..."):
-            for i, row in jobs_df.iterrows():
-                name = str(row["Nom"]).strip()
-                addr = str(row["Adresse"]).strip()
-                dur = int(row["Durée (min)"])
-                if not name or not addr:
-                    bad_rows.append(i)
-                    continue
-                try:
-                    g2 = geocode_address(addr)
-                except Exception as e:
-                    st.error(f"Erreur géocodage '{name}': {e}")
-                    st.stop()
+    after_route_idx, after_total = res
+    after_total2, after_travel, after_service = compute_baseline_total(after_route_idx, tm, service)
 
-                if g2 is None:
-                    bad_rows.append(i)
-                    continue
-                lat, lon, disp = g2
-                stops_jobs.append(Stop(name=name, address=disp, lat=lat, lon=lon, service_minutes=dur))
+    # (after_total et after_total2 devraient matcher ; on garde after_total2 comme contrôle)
+    after_total = after_total2
 
-                # petite pause douce (respect API) si beaucoup d'adresses non cachées
-                # (le cache st.cache_data évite la plupart des appels répétés)
-                time.sleep(0.1)
+    # -----------------------------
+    # Gains
+    # -----------------------------
+    gain_total = before_total - after_total
+    gain_travel = before_travel - after_travel  # c'est ça qui explique le gain
+    gain_pct = (gain_total / before_total * 100.0) if before_total > 0 else 0.0
 
-        if bad_rows:
-            st.warning(
-                f"{len(bad_rows)} ligne(s) ignorée(s) (adresse ou nom vide, ou géocodage impossible). "
-                "Corrige-les si besoin."
-            )
+    # Affichage synthèse
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Avant (total)", f"{before_total} min", help="Trajet + interventions, dans l’ordre saisi")
+    c2.metric("Après (total)", f"{after_total} min", help="Trajet + interventions, ordre optimisé")
+    c3.metric("Économie", f"{gain_total} min", f"{gain_pct:.1f} %")
 
-        if len(stops_jobs) == 0:
-            st.error("Aucune intervention géocodée correctement.")
-            st.stop()
+    # Détails trajet vs service (pour prouver le 'pourquoi')
+    st.markdown("### Détail Avant vs Après")
+    detail = pd.DataFrame(
+        [
+            {"": "Trajet", "Avant (min)": before_travel, "Après (min)": after_travel, "Gain (min)": gain_travel},
+            {"": "Interventions", "Avant (min)": before_service, "Après (min)": after_service, "Gain (min)": before_service - after_service},
+            {"": "TOTAL", "Avant (min)": before_total, "Après (min)": after_total, "Gain (min)": gain_total},
+        ]
+    )
+    st.dataframe(detail, use_container_width=True, hide_index=True)
 
-        # Construire la liste finale des stops pour le solveur
-        # Start = agence (ou position technicien si tu la remplaces plus tard)
-        # End = agence si retour demandé, sinon end = dernière intervention (non géré ici)
-        agency_stop = Stop(name=f"{agency_name} (Agence)", address=agency_disp, lat=agency_lat, lon=agency_lon, service_minutes=0)
+    # Afficher les routes
+    st.markdown("### Ordre des visites")
 
-        if return_to_agency:
-            # stops: [agency] + jobs + [agency_end]
-            # astuce : end = agence_end (nœud distinct) pour éviter doublons / ambiguïtés
-            agency_end = Stop(name=f"{agency_name} (Retour)", address=agency_disp, lat=agency_lat, lon=agency_lon, service_minutes=0)
-            stops_all = [agency_stop] + stops_jobs + [agency_end]
-            start_index = 0
-            end_index = len(stops_all) - 1
-        else:
-            st.warning("Mode 'sans retour agence' non activé dans ce POC (à faire si tu veux).")
-            # fallback : on force le retour pour éviter un résultat trompeur
-            agency_end = Stop(name=f"{agency_name} (Retour)", address=agency_disp, lat=agency_lat, lon=agency_lon, service_minutes=0)
-            stops_all = [agency_stop] + stops_jobs + [agency_end]
-            start_index = 0
-            end_index = len(stops_all) - 1
-
-        coords = [(s.lat, s.lon) for s in stops_all]
-        service = [s.service_minutes for s in stops_all]
-
-        # Matrice OSRM
-        with st.spinner("Calcul des temps de trajet (OSRM) ..."):
-            try:
-                tm = osrm_table_minutes(coords)
-            except Exception as e:
-                st.error(f"Erreur OSRM (temps de trajet): {e}")
-                st.stop()
-
-        # Optimisation
-        with st.spinner("Optimisation (OR-Tools) ..."):
-            res = solve_route(tm, service, start_index=start_index, end_index=end_index, time_limit_s=time_limit)
-
-        if res is None:
-            st.error("Aucune solution trouvée (contrainte/erreur).")
-            st.stop()
-
-        route_idx, total_min = res
-
-        # Affichage
+    def route_table(route_idx: List[int], label: str) -> pd.DataFrame:
         ordered = [stops_all[i] for i in route_idx]
-        st.success(f"Tournée calculée ✅ — Temps total estimé: **{total_min} min** (trajet + interventions)")
+        return pd.DataFrame({
+            "Ordre": list(range(1, len(ordered) + 1)),
+            "Point": [s.name for s in ordered],
+            "Adresse (résolue OSM)": [s.address_resolved for s in ordered],
+            "Durée intervention (min)": [s.service_minutes for s in ordered],
+        })
 
-        df_out = pd.DataFrame(
-            {
-                "Ordre": list(range(1, len(ordered) + 1)),
-                "Point": [s.name for s in ordered],
-                "Adresse (résolue)": [s.address for s in ordered],
-                "Durée intervention (min)": [s.service_minutes for s in ordered],
-            }
+    tab1, tab2 = st.tabs(["Avant (ordre saisi)", "Après (optimisé)"])
+    with tab1:
+        st.dataframe(route_table(baseline_route_idx, "Avant"), use_container_width=True, hide_index=True)
+    with tab2:
+        st.dataframe(route_table(after_route_idx, "Après"), use_container_width=True, hide_index=True)
+
+    # Explication concrète du gain
+    st.markdown("### Pourquoi tu économises ce temps (explication concrète)")
+    explanation = explain_savings(baseline_route_idx, after_route_idx, tm, stops_all)
+    st.write(explanation)
+
+    # Message très concret métier
+    if gain_total > 0:
+        st.success(
+            f"Conclusion : tu économises **{gain_total} min** principalement grâce à **{gain_travel} min** de trajets en moins. "
+            "Le temps sur site ne bouge pas : tu fais les mêmes interventions, mais dans un ordre plus logique."
         )
-        st.dataframe(df_out, use_container_width=True)
-
-        # Détail des trajets
-        st.subheader("Détail des trajets (minutes)")
-        legs = []
-        for a, b in zip(route_idx[:-1], route_idx[1:]):
-            legs.append(
-                {
-                    "De": stops_all[a].name,
-                    "Vers": stops_all[b].name,
-                    "Trajet (min)": tm[a][b],
-                    "Service à l'arrivée (min)": service[b],
-                    "Total jambe (min)": tm[a][b] + service[b],
-                }
-            )
-        st.dataframe(pd.DataFrame(legs), use_container_width=True)
-
-        st.caption(
-            "Astuce: pour une version 'temps réel trafic', on remplace OSRM par Google/Here/TomTom Distance Matrix "
-            "et on recalculera à chaque update de position technicien."
-        )
+    elif gain_total == 0:
+        st.info("Conclusion : pas de gain mesurable sur ce jeu de données (ordre déjà proche de l’optimal).")
+    else:
+        st.warning("Conclusion : l’ordre saisi semble déjà meilleur que la solution trouvée (rare). Augmente le temps de calcul.")
         
