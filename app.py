@@ -155,9 +155,17 @@ def solve_vrp_multi_tech(
         time_dim.CumulVar(idx).SetRange(0, deadline)
 
     # ---- Skills eligibility: job can only be served by allowed vehicles
-    for node, vehs in allowed_vehicles.items():
-        idx = manager.NodeToIndex(node)
-        routing.SetAllowedVehiclesForIndex(vehs, idx)
+for node, vehs in allowed_vehicles.items():
+    idx = manager.NodeToIndex(int(node))
+
+    # OR-Tools n'aime pas les numpy.int64 -> on cast en int Python
+    vehs_clean = [int(v) for v in vehs]
+
+    # Sécurité : éviter d'appliquer aux start/end (rare mais ça évite des crash)
+    if routing.IsStart(idx) or routing.IsEnd(idx):
+        continue
+
+    routing.SetAllowedVehiclesForIndex(vehs_clean, idx)
 
     # ---- Optional dropping with penalty (priority)
     # If allow_drop=False, we keep all jobs mandatory by not adding disjunction.
